@@ -226,6 +226,7 @@ async fn main() {
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Maximum number of concurrent client connections.
     const MAX_CONNECTIONS: usize = 100;
+    const TIMEOUT: u64 = 5;
 
     // Bind the TcpListener to a local IP address and port.
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
@@ -254,7 +255,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             let permit = connection_semaphore.acquire().await;
 
             // Wrap the handle_client call with a timeout of 5 seconds.
-            match timeout(Duration::from_secs(5), handle_client(stream, storage)).await {
+            match timeout(Duration::from_secs(TIMEOUT), handle_client(stream, storage)).await {
                 Ok(result) => {
                     if let Err(e) = result {
                         println!("Error handling client: {:?}", e);
