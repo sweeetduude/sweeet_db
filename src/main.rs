@@ -12,7 +12,9 @@ use tokio::io::BufWriter;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::Semaphore;
 use tokio::task;
+use tokio::time::{timeout, Duration};
 use tokio_util::codec::{BytesCodec, FramedRead};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -222,6 +224,9 @@ async fn main() {
 }
 
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
+    // Maximum number of concurrent client connections.
+    const MAX_CONNECTIONS: usize = 100;
+
     // Bind the TcpListener to a local IP address and port.
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
 
@@ -230,20 +235,38 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         store: load_data().await?,
     }));
 
+    // Create a semaphore to limit the number of concurrent client connections.
+    let connection_semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+
     // Enter an infinite loop to listen for incoming client connections.
     loop {
         // Accept an incoming connection and get the TcpStream and the client's address.
         let (stream, _) = listener.accept().await?;
 
-        // Clone the Arc storage to share it safely among multiple tasks.
+        // Clone the Arc storage and connection_semaphore to share them safely among multiple tasks.
         let storage = storage.clone();
+        let connection_semaphore = connection_semaphore.clone();
 
         // Spawn a new asynchronous task to handle the client connection.
         task::spawn(async move {
-            // If there is an error while handling the client, print the error message.
-            if let Err(e) = handle_client(stream, storage).await {
-                println!("Error handling client: {:?}", e);
+            // Acquire a permit from the semaphore. If all permits are in use, this will
+            // asynchronously wait until a permit becomes available.
+            let permit = connection_semaphore.acquire().await;
+
+            // Wrap the handle_client call with a timeout of 5 seconds.
+            match timeout(Duration::from_secs(5), handle_client(stream, storage)).await {
+                Ok(result) => {
+                    if let Err(e) = result {
+                        println!("Error handling client: {:?}", e);
+                    }
+                }
+                Err(_) => {
+                    println!("Client connection timed out after 5 seconds");
+                }
             }
+
+            // Drop the permit, allowing another connection to be processed.
+            drop(permit);
         });
     }
 }
