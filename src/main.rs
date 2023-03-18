@@ -3,6 +3,7 @@ use bincode;
 use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::fs::OpenOptions;
@@ -27,6 +28,25 @@ struct KeyValueStore {
 enum WriteOperation {
     Set(String, String),
     Del(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub max_connections: usize,
+    pub timeout: u64,
+    pub port: u16,
+    pub storage_file_path: PathBuf,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 100,
+            timeout: 15,
+            port: 8080,
+            storage_file_path: PathBuf::from("data.bin"),
+        }
+    }
 }
 
 // Handle a client's request by reading from the socket and calling the appropriate handler function.
@@ -201,8 +221,8 @@ async fn handle_set(
 
 // Load data from the file, returning an empty HashMap if the file does not exist or is empty.
 // Returns an error if there is a problem reading the file or deserializing the contents.
-async fn load_data() -> Result<HashMap<String, String>> {
-    match File::open("data.bin").await {
+async fn load_data(storage_file_path: &PathBuf) -> Result<HashMap<String, String>> {
+    match File::open(storage_file_path).await {
         Ok(file) => read_from_file(file).await,
         Err(_) => Ok(HashMap::new()),
     }
@@ -250,19 +270,24 @@ async fn write_to_file(store: &HashMap<String, String>) -> Result<()> {
 
 #[tokio::main]
 async fn main() {
+    // Create server configuration
+    let config = ServerConfig::default();
+
     // Run the server and handle any errors that may occur.
     // If the server shuts down gracefully, print a message to inform the user.
     // If there is an error during server execution, print the error message.
-    match run_server().await {
+    match run_server(&config).await {
         Ok(()) => println!("Server shut down gracefully."),
         Err(e) => eprintln!("Server error: {}", e),
     }
 }
 
 // Background task to synchronize write operations with the file storage
-async fn file_storage_sync(mut write_rx: mpsc::Receiver<WriteOperation>) {
+async fn file_storage_sync(mut write_rx: mpsc::Receiver<WriteOperation>, config: ServerConfig) {
     // Load the initial data from the file
-    let mut file_storage = load_data().await.unwrap_or_else(|_| HashMap::new());
+    let mut file_storage = load_data(&config.storage_file_path)
+        .await
+        .unwrap_or_else(|_| HashMap::new());
 
     // Process write operations from the queue
     while let Some(operation) = write_rx.recv().await {
@@ -282,27 +307,23 @@ async fn file_storage_sync(mut write_rx: mpsc::Receiver<WriteOperation>) {
     }
 }
 
-async fn run_server() -> Result<()> {
-    // Maximum number of concurrent client connections.
-    const MAX_CONNECTIONS: usize = 100;
-    const TIMEOUT: u64 = 15;
-
+async fn run_server(config: &ServerConfig) -> Result<()> {
     // Create a channel for write operations
     let (write_tx, write_rx) = mpsc::channel::<WriteOperation>(100);
 
     // Spawn the background task for synchronization
-    task::spawn(file_storage_sync(write_rx));
+    task::spawn(file_storage_sync(write_rx, config.clone()));
 
     // Bind the TcpListener to a local IP address and port.
-    let listener = TcpListener::bind("127.0.0.1:8080").await?;
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", config.port)).await?;
 
     // Create an asynchronous Mutex-protected KeyValueStore, initialized with data loaded from file.
     let storage = Arc::new(AsyncMutex::new(KeyValueStore {
-        store: load_data().await?,
+        store: load_data(&config.storage_file_path).await?,
     }));
 
     // Create a semaphore to limit the number of concurrent client connections.
-    let connection_semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let connection_semaphore = Arc::new(Semaphore::new(config.max_connections));
 
     // Enter an infinite loop to listen for incoming client connections.
     loop {
@@ -316,6 +337,7 @@ async fn run_server() -> Result<()> {
         let storage = storage.clone();
         let connection_semaphore = connection_semaphore.clone();
         let write_tx = write_tx.clone();
+        let config = config.clone();
 
         // Spawn a new asynchronous task to handle the client connection..
         task::spawn(async move {
@@ -325,7 +347,7 @@ async fn run_server() -> Result<()> {
 
             // Wrap the handle_client call with a timeout of 5 seconds.
             match timeout(
-                Duration::from_secs(TIMEOUT),
+                Duration::from_secs(config.timeout),
                 handle_client(stream, storage, write_tx),
             )
             .await
@@ -336,7 +358,10 @@ async fn run_server() -> Result<()> {
                     }
                 }
                 Err(_) => {
-                    println!("Client connection timed out after {} seconds", TIMEOUT);
+                    println!(
+                        "Client connection timed out after {} seconds",
+                        config.timeout
+                    );
                 }
             }
 
