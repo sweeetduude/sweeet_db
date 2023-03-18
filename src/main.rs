@@ -2,7 +2,6 @@ use bincode;
 use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::fs::OpenOptions;
@@ -17,6 +16,9 @@ use tokio::sync::Semaphore;
 use tokio::task;
 use tokio::time::{timeout, Duration};
 use tokio_util::codec::{BytesCodec, FramedRead};
+
+mod errors;
+use errors::KeyValueStoreError;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct KeyValueStore {
@@ -35,14 +37,14 @@ async fn handle_client(
     mut stream: TcpStream,
     storage: Arc<AsyncMutex<KeyValueStore>>,
     write_tx: mpsc::Sender<WriteOperation>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), KeyValueStoreError> {
     let mut buffer = [0; 1024];
 
     // Read from the socket
-    let n = stream.read(&mut buffer).await.map_err(|e| {
-        println!("Failed to read from socket: {}", e);
-        Box::new(e) as Box<dyn std::error::Error>
-    })?;
+    let n = stream
+        .read(&mut buffer)
+        .await
+        .map_err(KeyValueStoreError::ReadError)?;
 
     // Extract the request
     let request = String::from_utf8_lossy(&buffer[..n]).trim().to_owned();
@@ -58,7 +60,8 @@ async fn handle_client(
             stream
                 .write_all(response.as_bytes())
                 .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+                .map_err(KeyValueStoreError::WriteError)?;
+            Err(KeyValueStoreError::InvalidRequest)
         }
     }
 }
@@ -71,7 +74,7 @@ async fn handle_del(
     storage: Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
     write_tx: &mpsc::Sender<WriteOperation>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), KeyValueStoreError> {
     // Split the request only on the first two spaces
     let mut parts = request.splitn(2, ' ');
 
@@ -84,7 +87,10 @@ async fn handle_del(
         if storage.store.remove(key).is_some() {
             // Respond with 'OK' if the key is removed
             let response = "OK\n".to_owned();
-            stream.write_all(response.as_bytes()).await?;
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .map_err(KeyValueStoreError::WriteError)?;
 
             // Write the updated storage to the background task
             if let Err(e) = write_tx.send(WriteOperation::Del(key.to_owned())).await {
@@ -94,15 +100,16 @@ async fn handle_del(
         } else {
             // Respond with 'NOT FOUND' if the key is not in the storage
             let response = "NOT FOUND\n".to_owned();
-            stream.write_all(response.as_bytes()).await?;
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .map_err(KeyValueStoreError::WriteError)?;
+
             Ok(())
         }
     } else {
         // If no key is provided, return an error
-        Err(Box::new(Error::new(
-            ErrorKind::InvalidInput,
-            "Key not provided",
-        )))
+        Err(KeyValueStoreError::KeyNotProvided)
     }
 }
 
@@ -112,7 +119,7 @@ async fn handle_get(
     request: &str,
     storage: &Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), KeyValueStoreError> {
     // Split the request only on the first two spaces
     let mut parts = request.splitn(2, ' ');
 
@@ -125,20 +132,25 @@ async fn handle_get(
         if let Some(value) = storage.store.get(key) {
             // Respond with 'OK <value>' if the key is found
             let response = format!("OK {}\n", value);
-            stream.write_all(response.as_bytes()).await?;
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .map_err(KeyValueStoreError::WriteError)?;
+
             Ok(())
         } else {
             // Respond with 'NOT FOUND' if the key is not in the storage
             let response = "NOT FOUND\n".to_owned();
-            stream.write_all(response.as_bytes()).await?;
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .map_err(KeyValueStoreError::WriteError)?;
+
             Ok(())
         }
     } else {
         // If no key is provided, return an error
-        Err(Box::new(Error::new(
-            ErrorKind::InvalidInput,
-            "Key not provided",
-        )))
+        Err(KeyValueStoreError::KeyNotProvided)
     }
 }
 
@@ -150,7 +162,7 @@ async fn handle_set(
     storage: &Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
     write_tx: &mpsc::Sender<WriteOperation>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), KeyValueStoreError> {
     // Split the request only on the first space
     let mut parts = request.splitn(3, ' ');
 
@@ -166,7 +178,10 @@ async fn handle_set(
 
             // Respond with 'OK' if the key-value pair is added or updated
             let response = "OK\n".to_owned();
-            stream.write_all(response.as_bytes()).await?;
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .map_err(KeyValueStoreError::WriteError)?;
 
             // Write the updated storage to the background task
             if let Err(e) = write_tx
@@ -178,23 +193,17 @@ async fn handle_set(
             Ok(())
         } else {
             // If no value is provided, return an error
-            Err(Box::new(Error::new(
-                ErrorKind::InvalidInput,
-                "Value not provided",
-            )))
+            Err(KeyValueStoreError::ValueNotProvided)
         }
     } else {
         // If no key is provided, return an error
-        Err(Box::new(Error::new(
-            ErrorKind::InvalidInput,
-            "Key not provided",
-        )))
+        Err(KeyValueStoreError::KeyNotProvided)
     }
 }
 
 // Load data from the file, returning an empty HashMap if the file does not exist or is empty.
 // Returns an error if there is a problem reading the file or deserializing the contents.
-async fn load_data() -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+async fn load_data() -> Result<HashMap<String, String>, KeyValueStoreError> {
     match File::open("data.bin").await {
         Ok(file) => read_from_file(file).await,
         Err(_) => Ok(HashMap::new()),
@@ -203,12 +212,12 @@ async fn load_data() -> Result<HashMap<String, String>, Box<dyn std::error::Erro
 
 // Read data from the specified file, returning an empty HashMap if the file is empty.
 // Returns an error if there is a problem deserializing the contents of the file.
-async fn read_from_file(file: File) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+async fn read_from_file(file: File) -> Result<HashMap<String, String>, KeyValueStoreError> {
     let mut framed_read = FramedRead::new(file, BytesCodec::new());
     if let Some(Ok(buf)) = framed_read.next().await {
         match bincode::deserialize::<HashMap<String, String>>(&buf) {
             Ok(decoded) => Ok(decoded),
-            Err(e) => Err(Box::new(e)),
+            Err(e) => Err(KeyValueStoreError::DeserializeError(e)),
         }
     } else {
         Ok(HashMap::new())
@@ -217,18 +226,21 @@ async fn read_from_file(file: File) -> Result<HashMap<String, String>, Box<dyn s
 
 // Write the specified HashMap to the file, overwriting any existing data.
 // Returns an error if there is a problem opening the file, serializing the data, or writing to the file.
-async fn write_to_file(store: &HashMap<String, String>) -> Result<(), Box<dyn std::error::Error>> {
+async fn write_to_file(store: &HashMap<String, String>) -> Result<(), KeyValueStoreError> {
     let file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .open("data.bin")
-        .await?;
+        .await
+        .unwrap();
 
     let mut buffered_writer = BufWriter::new(file);
-    let serialized_data = bincode::serialize(&store)?;
-    buffered_writer.write_all(&serialized_data).await?;
-    buffered_writer.flush().await?;
+
+    let serialized_data =
+        bincode::serialize(&store).map_err(|e| KeyValueStoreError::SerializeError(e))?;
+    buffered_writer.write_all(&serialized_data).await.unwrap();
+    buffered_writer.flush().await.unwrap();
 
     Ok(())
 }
