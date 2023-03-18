@@ -11,6 +11,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::BufWriter;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 use tokio::task;
@@ -22,11 +23,18 @@ struct KeyValueStore {
     store: HashMap<String, String>,
 }
 
+#[derive(Debug)]
+enum WriteOperation {
+    Set(String, String),
+    Del(String),
+}
+
 // Handle a client's request by reading from the socket and calling the appropriate handler function.
 // Returns an error if the request is invalid or an error occurs while processing the request.
 async fn handle_client(
     mut stream: TcpStream,
     storage: Arc<AsyncMutex<KeyValueStore>>,
+    write_tx: mpsc::Sender<WriteOperation>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = [0; 1024];
 
@@ -42,9 +50,9 @@ async fn handle_client(
     // Match the command and call the appropriate handler function
     let command = request.split_whitespace().next();
     match command {
-        Some("SET") => handle_set(&request, &storage, &mut stream).await,
+        Some("SET") => handle_set(&request, &storage, &mut stream, &write_tx).await,
         Some("GET") => handle_get(&request, &storage, &mut stream).await,
-        Some("DEL") => handle_del(&request, storage.clone(), &mut stream).await,
+        Some("DEL") => handle_del(&request, storage.clone(), &mut stream, &write_tx).await,
         _ => {
             let response = "INVALID REQUEST\n".to_owned();
             stream
@@ -62,6 +70,7 @@ async fn handle_del(
     request: &str,
     storage: Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
+    write_tx: &mpsc::Sender<WriteOperation>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Split the request only on the first two spaces
     let mut parts = request.splitn(2, ' ');
@@ -77,9 +86,9 @@ async fn handle_del(
             let response = "OK\n".to_owned();
             stream.write_all(response.as_bytes()).await?;
 
-            // Write the updated storage to the file
-            if let Err(e) = write_to_file(&storage.store).await {
-                println!("Failed to write to file: {}", e);
+            // Write the updated storage to the background task
+            if let Err(e) = write_tx.send(WriteOperation::Del(key.to_owned())).await {
+                println!("Failed to send write operation to background task: {}", e);
             }
             Ok(())
         } else {
@@ -140,6 +149,7 @@ async fn handle_set(
     request: &str,
     storage: &Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
+    write_tx: &mpsc::Sender<WriteOperation>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Split the request only on the first space
     let mut parts = request.splitn(3, ' ');
@@ -158,9 +168,12 @@ async fn handle_set(
             let response = "OK\n".to_owned();
             stream.write_all(response.as_bytes()).await?;
 
-            // Write the updated storage to the file
-            if let Err(e) = write_to_file(&storage.store).await {
-                println!("Failed to write to file: {}", e);
+            // Write the updated storage to the background task
+            if let Err(e) = write_tx
+                .send(WriteOperation::Set(key.to_owned(), value.to_string()))
+                .await
+            {
+                println!("Failed to send write operation to background task: {}", e);
             }
             Ok(())
         } else {
@@ -231,10 +244,39 @@ async fn main() {
     }
 }
 
+// Background task to synchronize write operations with the file storage
+async fn file_storage_sync(mut write_rx: mpsc::Receiver<WriteOperation>) {
+    // Load the initial data from the file
+    let mut file_storage = load_data().await.unwrap_or_else(|_| HashMap::new());
+
+    // Process write operations from the queue
+    while let Some(operation) = write_rx.recv().await {
+        match operation {
+            WriteOperation::Set(key, value) => {
+                file_storage.insert(key, value);
+            }
+            WriteOperation::Del(key) => {
+                file_storage.remove(&key);
+            }
+        }
+
+        // Write the updated storage to the file
+        if let Err(e) = write_to_file(&file_storage).await {
+            println!("Failed to write to file: {}", e);
+        }
+    }
+}
+
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Maximum number of concurrent client connections.
     const MAX_CONNECTIONS: usize = 100;
     const TIMEOUT: u64 = 15;
+
+    // Create a channel for write operations
+    let (write_tx, write_rx) = mpsc::channel::<WriteOperation>(100);
+
+    // Spawn the background task for synchronization
+    task::spawn(file_storage_sync(write_rx));
 
     // Bind the TcpListener to a local IP address and port.
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
@@ -255,6 +297,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         // Clone the Arc storage and connection_semaphore to share them safely among multiple tasks.
         let storage = storage.clone();
         let connection_semaphore = connection_semaphore.clone();
+        let write_tx = write_tx.clone();
 
         // Spawn a new asynchronous task to handle the client connection.
         task::spawn(async move {
@@ -263,7 +306,12 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             let permit = connection_semaphore.acquire().await;
 
             // Wrap the handle_client call with a timeout of 5 seconds.
-            match timeout(Duration::from_secs(TIMEOUT), handle_client(stream, storage)).await {
+            match timeout(
+                Duration::from_secs(TIMEOUT),
+                handle_client(stream, storage, write_tx),
+            )
+            .await
+            {
                 Ok(result) => {
                     if let Err(e) = result {
                         println!("Error handling client: {:?}", e);
