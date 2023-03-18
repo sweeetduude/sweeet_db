@@ -36,16 +36,15 @@ async fn handle_client(
         Box::new(e) as Box<dyn std::error::Error>
     })?;
 
-    // Extract the request and parts
+    // Extract the request
     let request = String::from_utf8_lossy(&buffer[..n]).trim().to_owned();
-    let mut parts = request.split_whitespace();
-    let command = parts.next();
 
     // Match the command and call the appropriate handler function
+    let command = request.split_whitespace().next();
     match command {
-        Some("GET") => handle_get(parts, &storage, &mut stream).await,
-        Some("SET") => handle_set(parts, &storage, &mut stream).await,
-        Some("DEL") => handle_del(parts, storage.clone(), &mut stream).await,
+        Some("SET") => handle_set(&request, &storage, &mut stream).await,
+        Some("GET") => handle_get(&request, &storage, &mut stream).await,
+        Some("DEL") => handle_del(&request, storage.clone(), &mut stream).await,
         _ => {
             let response = "INVALID REQUEST\n".to_owned();
             stream
@@ -60,12 +59,15 @@ async fn handle_client(
 // Responds with 'OK' if the key is removed or 'NOT FOUND' if the key is not in the storage.
 // If the operation is successful, it also writes the updated storage to the file.
 async fn handle_del(
-    mut parts: std::str::SplitWhitespace<'_>,
+    request: &str,
     storage: Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Split the request only on the first two spaces
+    let mut parts = request.splitn(2, ' ');
+
     // Check if a key is provided
-    if let Some(key) = parts.next() {
+    if let Some(key) = parts.nth(1) {
         // Lock the storage for exclusive access
         let mut storage = storage.lock().await;
 
@@ -98,12 +100,15 @@ async fn handle_del(
 // Handle the 'get' operation by retrieving the value for the specified key from the storage.
 // Responds with 'OK <value>' if the key is found or 'NOT FOUND' if the key is not in the storage.
 async fn handle_get(
-    mut parts: std::str::SplitWhitespace<'_>,
+    request: &str,
     storage: &Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Split the request only on the first two spaces
+    let mut parts = request.splitn(2, ' ');
+
     // Check if a key is provided
-    if let Some(key) = parts.next() {
+    if let Some(key) = parts.nth(1) {
         // Lock the storage for shared access
         let storage = storage.lock().await;
 
@@ -132,19 +137,22 @@ async fn handle_get(
 // Responds with 'OK' if the key-value pair is added or updated.
 // If the operation is successful, it also writes the updated storage to the file.
 async fn handle_set(
-    mut parts: std::str::SplitWhitespace<'_>,
+    request: &str,
     storage: &Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Split the request only on the first space
+    let mut parts = request.splitn(3, ' ');
+
     // Check if a key is provided
-    if let Some(key) = parts.next() {
+    if let Some(key) = parts.nth(1) {
         // Check if a value is provided
         if let Some(value) = parts.next() {
             // Lock the storage for exclusive access
             let mut storage = storage.lock().await;
 
             // Insert or update the key-value pair in the storage
-            storage.store.insert(key.to_owned(), value.to_owned());
+            storage.store.insert(key.to_owned(), value.to_string());
 
             // Respond with 'OK' if the key-value pair is added or updated
             let response = "OK\n".to_owned();
@@ -226,7 +234,7 @@ async fn main() {
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Maximum number of concurrent client connections.
     const MAX_CONNECTIONS: usize = 100;
-    const TIMEOUT: u64 = 5;
+    const TIMEOUT: u64 = 15;
 
     // Bind the TcpListener to a local IP address and port.
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
@@ -262,7 +270,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(_) => {
-                    println!("Client connection timed out after 5 seconds");
+                    println!("Client connection timed out after {} seconds", TIMEOUT);
                 }
             }
 
