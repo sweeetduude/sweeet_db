@@ -49,6 +49,47 @@ impl Default for ServerConfig {
     }
 }
 
+#[derive(Debug)]
+enum Command {
+    Set(String, String),
+    Get(String),
+    Del(String),
+}
+
+fn parse_command(command_str: &str) -> Result<Command, String> {
+    let mut parts = command_str.splitn(3, ' ');
+    let command_type = parts.next().ok_or("Missing command type")?;
+
+    match command_type.to_uppercase().as_str() {
+        "SET" => {
+            let key = parts
+                .next()
+                .ok_or("Missing key for SET command")?
+                .to_string();
+            let value = parts
+                .next()
+                .ok_or("Missing value for SET command")?
+                .to_string();
+            Ok(Command::Set(key, value))
+        }
+        "GET" => {
+            let key = parts
+                .next()
+                .ok_or("Missing key for GET command")?
+                .to_string();
+            Ok(Command::Get(key))
+        }
+        "DEL" => {
+            let key = parts
+                .next()
+                .ok_or("Missing key for DEL command")?
+                .to_string();
+            Ok(Command::Del(key))
+        }
+        _ => Err(format!("Invalid command type: {}", command_type)),
+    }
+}
+
 // Handle a client's request by reading from the socket and calling the appropriate handler function.
 // Returns an error if the request is invalid or an error occurs while processing the request.
 async fn handle_client(
@@ -68,18 +109,20 @@ async fn handle_client(
     let request = String::from_utf8_lossy(&buffer[..n]).trim().to_owned();
 
     // Match the command and call the appropriate handler function
-    let command = request.split_whitespace().next();
-    match command {
-        Some("SET") => handle_set(&request, &storage, &mut stream, &write_tx).await,
-        Some("GET") => handle_get(&request, &storage, &mut stream).await,
-        Some("DEL") => handle_del(&request, storage.clone(), &mut stream, &write_tx).await,
-        _ => {
+    //let command = request.split_whitespace().next();
+    match parse_command(&request) {
+        Ok(Command::Set(key, value)) => {
+            handle_set(&key, &value, &storage, &mut stream, &write_tx).await
+        }
+        Ok(Command::Get(key)) => handle_get(&key, &storage, &mut stream).await,
+        Ok(Command::Del(key)) => handle_del(&key, &storage, &mut stream, &write_tx).await,
+        Err(err_msg) => {
             let response = "INVALID REQUEST\n".to_owned();
             stream
                 .write_all(response.as_bytes())
                 .await
                 .context("Error writing response")?;
-            Err(anyhow!("No matching command"))
+            Err(anyhow!(err_msg))
         }
     }
 }
@@ -88,87 +131,69 @@ async fn handle_client(
 // Responds with 'OK' if the key is removed or 'NOT FOUND' if the key is not in the storage.
 // If the operation is successful, it also writes the updated storage to the file.
 async fn handle_del(
-    request: &str,
-    storage: Arc<AsyncMutex<KeyValueStore>>,
+    key: &str,
+    storage: &Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
     write_tx: &mpsc::Sender<WriteOperation>,
 ) -> Result<()> {
-    // Split the request only on the first two spaces
-    let mut parts = request.splitn(2, ' ');
+    // Lock the storage for exclusive access
+    let mut storage = storage.lock().await;
 
-    // Check if a key is provided
-    if let Some(key) = parts.nth(1) {
-        // Lock the storage for exclusive access
-        let mut storage = storage.lock().await;
+    // Attempt to remove the key from the storage
+    if storage.store.remove(key).is_some() {
+        // Respond with 'OK' if the key is removed
+        let response = "OK\n".to_owned();
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .context("Error writing response")?;
 
-        // Attempt to remove the key from the storage
-        if storage.store.remove(key).is_some() {
-            // Respond with 'OK' if the key is removed
-            let response = "OK\n".to_owned();
-            stream
-                .write_all(response.as_bytes())
-                .await
-                .context("Error writing response")?;
-
-            // Write the updated storage to the background task
-            if let Err(e) = write_tx.send(WriteOperation::Del(key.to_owned())).await {
-                println!("Failed to send write operation to background task: {}", e);
-            }
-            Ok(())
-        } else {
-            // Respond with 'NOT FOUND' if the key is not in the storage
-            let response = "NOT FOUND\n".to_owned();
-            stream
-                .write_all(response.as_bytes())
-                .await
-                .context("Error writing response")?;
-
-            Ok(())
+        // Write the updated storage to the background task
+        if let Err(e) = write_tx.send(WriteOperation::Del(key.to_owned())).await {
+            println!("Failed to send write operation to background task: {}", e);
         }
+        Ok(())
     } else {
-        // If no key is provided, return an error
-        Err(anyhow!("No key provided"))
+        // Respond with 'NOT FOUND' if the key is not in the storage
+        let response = "NOT FOUND\n".to_owned();
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .context("Error writing response")?;
+
+        Ok(())
     }
 }
 
 // Handle the 'get' operation by retrieving the value for the specified key from the storage.
 // Responds with 'OK <value>' if the key is found or 'NOT FOUND' if the key is not in the storage.
 async fn handle_get(
-    request: &str,
+    key: &str,
     storage: &Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
 ) -> Result<()> {
-    // Split the request only on the first two spaces
-    let mut parts = request.splitn(2, ' ');
+    // Lock the storage for shared access
+    let storage = storage.lock().await;
 
-    // Check if a key is provided
-    if let Some(key) = parts.nth(1) {
-        // Lock the storage for shared access
-        let storage = storage.lock().await;
+    // Attempt to get the value for the key from the storage
+    if let Some(value) = storage.store.get(key) {
+        // Respond with 'OK <value>' if the key is found
+        let response = format!("OK {}\n", value);
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .context("Error writing response")?;
 
-        // Attempt to get the value for the key from the storage
-        if let Some(value) = storage.store.get(key) {
-            // Respond with 'OK <value>' if the key is found
-            let response = format!("OK {}\n", value);
-            stream
-                .write_all(response.as_bytes())
-                .await
-                .context("Error writing response")?;
-
-            Ok(())
-        } else {
-            // Respond with 'NOT FOUND' if the key is not in the storage
-            let response = "NOT FOUND\n".to_owned();
-            stream
-                .write_all(response.as_bytes())
-                .await
-                .context("Error writing response")?;
-
-            Ok(())
-        }
+        Ok(())
     } else {
-        // If no key is provided, return an error
-        Err(anyhow!("No key provided"))
+        // Respond with 'NOT FOUND' if the key is not in the storage
+        let response = "NOT FOUND\n".to_owned();
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .context("Error writing response")?;
+
+        Ok(())
     }
 }
 
@@ -176,47 +201,33 @@ async fn handle_get(
 // Responds with 'OK' if the key-value pair is added or updated.
 // If the operation is successful, it also writes the updated storage to the file.
 async fn handle_set(
-    request: &str,
+    key: &str,
+    value: &str,
     storage: &Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
     write_tx: &mpsc::Sender<WriteOperation>,
 ) -> Result<()> {
-    // Split the request only on the first space
-    let mut parts = request.splitn(3, ' ');
+    // Lock the storage for exclusive access
+    let mut storage = storage.lock().await;
 
-    // Check if a key is provided
-    if let Some(key) = parts.nth(1) {
-        // Check if a value is provided
-        if let Some(value) = parts.next() {
-            // Lock the storage for exclusive access
-            let mut storage = storage.lock().await;
+    // Insert or update the key-value pair in the storage
+    storage.store.insert(key.to_owned(), value.to_string());
 
-            // Insert or update the key-value pair in the storage
-            storage.store.insert(key.to_owned(), value.to_string());
+    // Respond with 'OK' if the key-value pair is added or updated
+    let response = "OK\n".to_owned();
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("Error writing response")?;
 
-            // Respond with 'OK' if the key-value pair is added or updated
-            let response = "OK\n".to_owned();
-            stream
-                .write_all(response.as_bytes())
-                .await
-                .context("Error writing response")?;
-
-            // Write the updated storage to the background task
-            if let Err(e) = write_tx
-                .send(WriteOperation::Set(key.to_owned(), value.to_string()))
-                .await
-            {
-                println!("Failed to send write operation to background task: {}", e);
-            }
-            Ok(())
-        } else {
-            // If no value is provided, return an error
-            Err(anyhow!("No value provided"))
-        }
-    } else {
-        // If no key is provided, return an error
-        Err(anyhow!("No key provided"))
+    // Write the updated storage to the background task
+    if let Err(e) = write_tx
+        .send(WriteOperation::Set(key.to_owned(), value.to_string()))
+        .await
+    {
+        println!("Failed to send write operation to background task: {}", e);
     }
+    Ok(())
 }
 
 // Load data from the file, returning an empty HashMap if the file does not exist or is empty.
