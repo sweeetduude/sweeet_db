@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Context, Result};
 use bincode;
 use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -17,9 +18,6 @@ use tokio::task;
 use tokio::time::{timeout, Duration};
 use tokio_util::codec::{BytesCodec, FramedRead};
 
-mod errors;
-use errors::KeyValueStoreError;
-
 #[derive(Serialize, Deserialize, Debug)]
 struct KeyValueStore {
     store: HashMap<String, String>,
@@ -37,14 +35,14 @@ async fn handle_client(
     mut stream: TcpStream,
     storage: Arc<AsyncMutex<KeyValueStore>>,
     write_tx: mpsc::Sender<WriteOperation>,
-) -> Result<(), KeyValueStoreError> {
+) -> Result<()> {
     let mut buffer = [0; 1024];
 
     // Read from the socket
     let n = stream
         .read(&mut buffer)
         .await
-        .map_err(KeyValueStoreError::ReadError)?;
+        .context("Failed to read from the socket")?;
 
     // Extract the request
     let request = String::from_utf8_lossy(&buffer[..n]).trim().to_owned();
@@ -60,8 +58,8 @@ async fn handle_client(
             stream
                 .write_all(response.as_bytes())
                 .await
-                .map_err(KeyValueStoreError::WriteError)?;
-            Err(KeyValueStoreError::InvalidRequest)
+                .context("Error writing response")?;
+            Err(anyhow!("No matching command"))
         }
     }
 }
@@ -74,7 +72,7 @@ async fn handle_del(
     storage: Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
     write_tx: &mpsc::Sender<WriteOperation>,
-) -> Result<(), KeyValueStoreError> {
+) -> Result<()> {
     // Split the request only on the first two spaces
     let mut parts = request.splitn(2, ' ');
 
@@ -90,7 +88,7 @@ async fn handle_del(
             stream
                 .write_all(response.as_bytes())
                 .await
-                .map_err(KeyValueStoreError::WriteError)?;
+                .context("Error writing response")?;
 
             // Write the updated storage to the background task
             if let Err(e) = write_tx.send(WriteOperation::Del(key.to_owned())).await {
@@ -103,13 +101,13 @@ async fn handle_del(
             stream
                 .write_all(response.as_bytes())
                 .await
-                .map_err(KeyValueStoreError::WriteError)?;
+                .context("Error writing response")?;
 
             Ok(())
         }
     } else {
         // If no key is provided, return an error
-        Err(KeyValueStoreError::KeyNotProvided)
+        Err(anyhow!("No key provided"))
     }
 }
 
@@ -119,7 +117,7 @@ async fn handle_get(
     request: &str,
     storage: &Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
-) -> Result<(), KeyValueStoreError> {
+) -> Result<()> {
     // Split the request only on the first two spaces
     let mut parts = request.splitn(2, ' ');
 
@@ -135,7 +133,7 @@ async fn handle_get(
             stream
                 .write_all(response.as_bytes())
                 .await
-                .map_err(KeyValueStoreError::WriteError)?;
+                .context("Error writing response")?;
 
             Ok(())
         } else {
@@ -144,13 +142,13 @@ async fn handle_get(
             stream
                 .write_all(response.as_bytes())
                 .await
-                .map_err(KeyValueStoreError::WriteError)?;
+                .context("Error writing response")?;
 
             Ok(())
         }
     } else {
         // If no key is provided, return an error
-        Err(KeyValueStoreError::KeyNotProvided)
+        Err(anyhow!("No key provided"))
     }
 }
 
@@ -162,7 +160,7 @@ async fn handle_set(
     storage: &Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
     write_tx: &mpsc::Sender<WriteOperation>,
-) -> Result<(), KeyValueStoreError> {
+) -> Result<()> {
     // Split the request only on the first space
     let mut parts = request.splitn(3, ' ');
 
@@ -181,7 +179,7 @@ async fn handle_set(
             stream
                 .write_all(response.as_bytes())
                 .await
-                .map_err(KeyValueStoreError::WriteError)?;
+                .context("Error writing response")?;
 
             // Write the updated storage to the background task
             if let Err(e) = write_tx
@@ -193,17 +191,17 @@ async fn handle_set(
             Ok(())
         } else {
             // If no value is provided, return an error
-            Err(KeyValueStoreError::ValueNotProvided)
+            Err(anyhow!("No value provided"))
         }
     } else {
         // If no key is provided, return an error
-        Err(KeyValueStoreError::KeyNotProvided)
+        Err(anyhow!("No key provided"))
     }
 }
 
 // Load data from the file, returning an empty HashMap if the file does not exist or is empty.
 // Returns an error if there is a problem reading the file or deserializing the contents.
-async fn load_data() -> Result<HashMap<String, String>, KeyValueStoreError> {
+async fn load_data() -> Result<HashMap<String, String>> {
     match File::open("data.bin").await {
         Ok(file) => read_from_file(file).await,
         Err(_) => Ok(HashMap::new()),
@@ -212,12 +210,12 @@ async fn load_data() -> Result<HashMap<String, String>, KeyValueStoreError> {
 
 // Read data from the specified file, returning an empty HashMap if the file is empty.
 // Returns an error if there is a problem deserializing the contents of the file.
-async fn read_from_file(file: File) -> Result<HashMap<String, String>, KeyValueStoreError> {
+async fn read_from_file(file: File) -> Result<HashMap<String, String>> {
     let mut framed_read = FramedRead::new(file, BytesCodec::new());
     if let Some(Ok(buf)) = framed_read.next().await {
         match bincode::deserialize::<HashMap<String, String>>(&buf) {
             Ok(decoded) => Ok(decoded),
-            Err(e) => Err(KeyValueStoreError::DeserializeError(e)),
+            Err(_) => Err(anyhow!("Error deserializing the content")),
         }
     } else {
         Ok(HashMap::new())
@@ -226,7 +224,7 @@ async fn read_from_file(file: File) -> Result<HashMap<String, String>, KeyValueS
 
 // Write the specified HashMap to the file, overwriting any existing data.
 // Returns an error if there is a problem opening the file, serializing the data, or writing to the file.
-async fn write_to_file(store: &HashMap<String, String>) -> Result<(), KeyValueStoreError> {
+async fn write_to_file(store: &HashMap<String, String>) -> Result<()> {
     let file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -237,10 +235,15 @@ async fn write_to_file(store: &HashMap<String, String>) -> Result<(), KeyValueSt
 
     let mut buffered_writer = BufWriter::new(file);
 
-    let serialized_data =
-        bincode::serialize(&store).map_err(|e| KeyValueStoreError::SerializeError(e))?;
-    buffered_writer.write_all(&serialized_data).await.unwrap();
-    buffered_writer.flush().await.unwrap();
+    let serialized_data = bincode::serialize(&store).context("Error serializing data")?;
+    buffered_writer
+        .write_all(&serialized_data)
+        .await
+        .context("Error writing to file")?;
+    buffered_writer
+        .flush()
+        .await
+        .context("Error writing to file")?;
 
     Ok(())
 }
@@ -279,7 +282,7 @@ async fn file_storage_sync(mut write_rx: mpsc::Receiver<WriteOperation>) {
     }
 }
 
-async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_server() -> Result<()> {
     // Maximum number of concurrent client connections.
     const MAX_CONNECTIONS: usize = 100;
     const TIMEOUT: u64 = 15;
@@ -304,14 +307,17 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Enter an infinite loop to listen for incoming client connections.
     loop {
         // Accept an incoming connection and get the TcpStream and the client's address.
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("Could not get the client")?;
 
         // Clone the Arc storage and connection_semaphore to share them safely among multiple tasks.
         let storage = storage.clone();
         let connection_semaphore = connection_semaphore.clone();
         let write_tx = write_tx.clone();
 
-        // Spawn a new asynchronous task to handle the client connection.
+        // Spawn a new asynchronous task to handle the client connection..
         task::spawn(async move {
             // Acquire a permit from the semaphore. If all permits are in use, this will
             // asynchronously wait until a permit becomes available.
