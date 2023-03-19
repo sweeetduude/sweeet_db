@@ -4,6 +4,7 @@ use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::fs::OpenOptions;
@@ -16,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 use tokio::task;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 use tokio_util::codec::{BytesCodec, FramedRead};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -42,7 +43,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             max_connections: 100,
-            timeout: 15,
+            timeout: 60,
             port: 8080,
             storage_file_path: PathBuf::from("data.bin"),
         }
@@ -54,6 +55,7 @@ enum Command<'a> {
     Set(&'a str, &'a str),
     Get(&'a str),
     Del(&'a str),
+    Ping,
 }
 
 fn parse_command(command_str: &str) -> Result<Command, String> {
@@ -74,6 +76,7 @@ fn parse_command(command_str: &str) -> Result<Command, String> {
             let key = parts.next().ok_or("Missing key for DEL command")?;
             Ok(Command::Del(key))
         }
+        "PING" => Ok(Command::Ping),
         _ => Err(format!("Invalid command type: {}", command_type)),
     }
 }
@@ -85,33 +88,80 @@ async fn handle_client(
     storage: Arc<AsyncMutex<KeyValueStore>>,
     write_tx: mpsc::Sender<WriteOperation>,
 ) -> Result<()> {
-    let mut buffer = [0; 1024];
+    let time_elapsed = Arc::new(AtomicU64::new(0));
+    let stop_client = Arc::new(AtomicBool::new(false));
 
-    // Read from the socket
-    let n = stream
-        .read(&mut buffer)
-        .await
-        .context("Failed to read from the socket")?;
+    let time_elapsed_clone = time_elapsed.clone();
+    let stop_client_clone = stop_client.clone();
 
-    // Extract the request
-    let request = String::from_utf8_lossy(&buffer[..n]).trim().to_owned();
-
-    // Match the command and call the appropriate handler function
-    match parse_command(&request) {
-        Ok(Command::Set(key, value)) => {
-            handle_set(&key, &value, &storage, &mut stream, &write_tx).await
+    task::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let elapsed = time_elapsed_clone.load(Ordering::SeqCst) + 1;
+            if elapsed > 15 {
+                stop_client_clone.store(true, Ordering::SeqCst);
+                break;
+            }
+            time_elapsed_clone.store(elapsed, Ordering::SeqCst);
+            println!("{}", elapsed);
         }
-        Ok(Command::Get(key)) => handle_get(&key, &storage, &mut stream).await,
-        Ok(Command::Del(key)) => handle_del(&key, &storage, &mut stream, &write_tx).await,
-        Err(err_msg) => {
-            let response = b"INVALID REQUEST\n";
-            stream
-                .write_all(response)
-                .await
-                .context("Error writing response")?;
-            Err(anyhow!(err_msg))
+    });
+
+    let mut buffer = [0; 1024];
+    loop {
+        // Read from the socket
+        let n = match stream.read(&mut buffer).await {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("Error reading from socket: {}", e);
+                return Err(anyhow!(e));
+            }
+        };
+
+        // If n is 0, the client closed the connection
+        if n == 0 || stop_client.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Extract the request
+        let request = String::from_utf8_lossy(&buffer[..n]).trim().to_owned();
+
+        // Match the command and call the appropriate handler function
+        match parse_command(&request) {
+            Ok(Command::Set(key, value)) => {
+                if let Err(e) = handle_set(&key, &value, &storage, &mut stream, &write_tx).await {
+                    eprintln!("Error handling SET: {:?}", e);
+                }
+            }
+            Ok(Command::Get(key)) => {
+                if let Err(e) = handle_get(&key, &storage, &mut stream).await {
+                    eprintln!("Error handling GET: {:?}", e);
+                }
+            }
+            Ok(Command::Del(key)) => {
+                if let Err(e) = handle_del(&key, &storage, &mut stream, &write_tx).await {
+                    eprintln!("Error handling DEL: {:?}", e);
+                }
+            }
+            Ok(Command::Ping) => {
+                time_elapsed.store(0, Ordering::SeqCst);
+
+                let response = b"PONG\n";
+                if let Err(e) = stream.write_all(response).await {
+                    eprintln!("Error writing response: {}", e);
+                }
+            }
+            Err(err_msg) => {
+                let response = b"INVALID REQUEST\n";
+                if let Err(e) = stream.write_all(response).await {
+                    eprintln!("Error writing response: {}", e);
+                }
+                eprintln!("Invalid command: {}", err_msg);
+            }
         }
     }
+    Ok(())
 }
 
 // Handle the 'del' operation by removing the specified key from the storage.
@@ -335,7 +385,6 @@ async fn run_server(config: &ServerConfig) -> Result<()> {
         let storage = storage.clone();
         let connection_semaphore = connection_semaphore.clone();
         let write_tx = write_tx.clone();
-        let config = config.clone();
 
         // Spawn a new asynchronous task to handle the client connection..
         task::spawn(async move {
@@ -343,24 +392,9 @@ async fn run_server(config: &ServerConfig) -> Result<()> {
             // asynchronously wait until a permit becomes available.
             let permit = connection_semaphore.acquire().await;
 
-            // Wrap the handle_client call with a timeout of 5 seconds.
-            match timeout(
-                Duration::from_secs(config.timeout),
-                handle_client(stream, storage, write_tx),
-            )
-            .await
-            {
-                Ok(result) => {
-                    if let Err(e) = result {
-                        println!("Error handling client: {:?}", e);
-                    }
-                }
-                Err(_) => {
-                    println!(
-                        "Client connection timed out after {} seconds",
-                        config.timeout
-                    );
-                }
+            // Removed the timeout wrapper, calling handle_client directly
+            if let Err(e) = handle_client(stream, storage, write_tx).await {
+                println!("Error handling client: {:?}", e);
             }
 
             // Drop the permit, allowing another connection to be processed.

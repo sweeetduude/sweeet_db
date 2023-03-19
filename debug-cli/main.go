@@ -11,7 +11,7 @@ import (
 
 const (
 	serverAddress = "127.0.0.1:8080"
-	timeout       = 5 * time.Second
+	timeout       = 60 * time.Second
 )
 
 func main() {
@@ -19,17 +19,27 @@ func main() {
 	fmt.Println("Welcome to the SweeetDB CLI")
 	fmt.Println("Type commands like 'SET key value', 'GET key', 'DEL key' or 'exit' to quit")
 
+	conn, err := net.DialTimeout("tcp", serverAddress, timeout)
+	if err != nil {
+		fmt.Println("failed to connect to the server: %w", err)
+	}
+	defer conn.Close()
+
 	for {
 		fmt.Print("> ")
 		scanner.Scan()
 		input := scanner.Text()
 		command := strings.TrimSpace(input)
 
+		if strings.ToLower(command) == "connect" {
+			conn, _ = net.Dial("tcp", serverAddress)
+		}
+
 		if strings.ToLower(command) == "exit" {
 			break
 		}
 
-		response, err := sendCommand(command)
+		response, err := sendCommand(command, conn)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 		} else {
@@ -38,14 +48,9 @@ func main() {
 	}
 }
 
-func sendCommand(command string) (string, error) {
-	conn, err := net.DialTimeout("tcp", serverAddress, timeout)
-	if err != nil {
-		return "", fmt.Errorf("failed to connect to the server: %w", err)
-	}
-	defer conn.Close()
+func sendCommand(command string, conn net.Conn) (string, error) {
 
-	err = conn.SetWriteDeadline(time.Now().Add(timeout))
+	err := conn.SetWriteDeadline(time.Now().Add(timeout))
 	if err != nil {
 		return "", fmt.Errorf("failed to set write deadline: %w", err)
 	}
