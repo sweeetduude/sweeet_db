@@ -109,7 +109,6 @@ async fn handle_client(
     let request = String::from_utf8_lossy(&buffer[..n]).trim().to_owned();
 
     // Match the command and call the appropriate handler function
-    //let command = request.split_whitespace().next();
     match parse_command(&request) {
         Ok(Command::Set(key, value)) => {
             handle_set(&key, &value, &storage, &mut stream, &write_tx).await
@@ -178,7 +177,7 @@ async fn handle_get(
     // Attempt to get the value for the key from the storage
     if let Some(value) = storage.store.get(key) {
         // Respond with 'OK <value>' if the key is found
-        let response = format!("OK {}\n", value);
+        let response = format!("{}\n", value);
         stream
             .write_all(response.as_bytes())
             .await
@@ -255,14 +254,14 @@ async fn read_from_file(file: File) -> Result<HashMap<String, String>> {
 
 // Write the specified HashMap to the file, overwriting any existing data.
 // Returns an error if there is a problem opening the file, serializing the data, or writing to the file.
-async fn write_to_file(store: &HashMap<String, String>) -> Result<()> {
+async fn write_to_file(store: &HashMap<String, String>, storage_file_path: &PathBuf) -> Result<()> {
     let file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open("data.bin")
+        .open(storage_file_path)
         .await
-        .unwrap();
+        .context("Error opening file")?;
 
     let mut buffered_writer = BufWriter::new(file);
 
@@ -312,7 +311,7 @@ async fn file_storage_sync(mut write_rx: mpsc::Receiver<WriteOperation>, config:
         }
 
         // Write the updated storage to the file
-        if let Err(e) = write_to_file(&file_storage).await {
+        if let Err(e) = write_to_file(&file_storage, &config.storage_file_path).await {
             println!("Failed to write to file: {}", e);
         }
     }
