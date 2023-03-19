@@ -50,10 +50,10 @@ impl Default for ServerConfig {
 }
 
 #[derive(Debug)]
-enum Command {
-    Set(String, String),
-    Get(String),
-    Del(String),
+enum Command<'a> {
+    Set(&'a str, &'a str),
+    Get(&'a str),
+    Del(&'a str),
 }
 
 fn parse_command(command_str: &str) -> Result<Command, String> {
@@ -62,28 +62,16 @@ fn parse_command(command_str: &str) -> Result<Command, String> {
 
     match command_type.to_uppercase().as_str() {
         "SET" => {
-            let key = parts
-                .next()
-                .ok_or("Missing key for SET command")?
-                .to_string();
-            let value = parts
-                .next()
-                .ok_or("Missing value for SET command")?
-                .to_string();
+            let key = parts.next().ok_or("Missing key for SET command")?;
+            let value = parts.next().ok_or("Missing value for SET command")?;
             Ok(Command::Set(key, value))
         }
         "GET" => {
-            let key = parts
-                .next()
-                .ok_or("Missing key for GET command")?
-                .to_string();
+            let key = parts.next().ok_or("Missing key for GET command")?;
             Ok(Command::Get(key))
         }
         "DEL" => {
-            let key = parts
-                .next()
-                .ok_or("Missing key for DEL command")?
-                .to_string();
+            let key = parts.next().ok_or("Missing key for DEL command")?;
             Ok(Command::Del(key))
         }
         _ => Err(format!("Invalid command type: {}", command_type)),
@@ -116,9 +104,9 @@ async fn handle_client(
         Ok(Command::Get(key)) => handle_get(&key, &storage, &mut stream).await,
         Ok(Command::Del(key)) => handle_del(&key, &storage, &mut stream, &write_tx).await,
         Err(err_msg) => {
-            let response = "INVALID REQUEST\n".to_owned();
+            let response = b"INVALID REQUEST\n";
             stream
-                .write_all(response.as_bytes())
+                .write_all(response)
                 .await
                 .context("Error writing response")?;
             Err(anyhow!(err_msg))
@@ -141,9 +129,9 @@ async fn handle_del(
     // Attempt to remove the key from the storage
     if storage.store.remove(key).is_some() {
         // Respond with 'OK' if the key is removed
-        let response = "OK\n".to_owned();
+        let response = b"OK\n";
         stream
-            .write_all(response.as_bytes())
+            .write_all(response)
             .await
             .context("Error writing response")?;
 
@@ -154,9 +142,9 @@ async fn handle_del(
         Ok(())
     } else {
         // Respond with 'NOT FOUND' if the key is not in the storage
-        let response = "NOT FOUND\n".to_owned();
+        let response = b"NOT FOUND\n";
         stream
-            .write_all(response.as_bytes())
+            .write_all(response)
             .await
             .context("Error writing response")?;
 
@@ -186,9 +174,9 @@ async fn handle_get(
         Ok(())
     } else {
         // Respond with 'NOT FOUND' if the key is not in the storage
-        let response = "NOT FOUND\n".to_owned();
+        let response = b"NOT FOUND\n";
         stream
-            .write_all(response.as_bytes())
+            .write_all(response)
             .await
             .context("Error writing response")?;
 
@@ -213,9 +201,9 @@ async fn handle_set(
     storage.store.insert(key.to_owned(), value.to_string());
 
     // Respond with 'OK' if the key-value pair is added or updated
-    let response = "OK\n".to_owned();
+    let response = b"OK\n";
     stream
-        .write_all(response.as_bytes())
+        .write_all(response)
         .await
         .context("Error writing response")?;
 
