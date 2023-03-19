@@ -105,7 +105,6 @@ async fn handle_client(
                 break;
             }
             time_elapsed_clone.store(elapsed, Ordering::SeqCst);
-            println!("{}", elapsed);
         }
     });
 
@@ -114,7 +113,6 @@ async fn handle_client(
     loop {
         // If stop_client is called close the connection
         if stop_client.load(Ordering::SeqCst) {
-            println!("breaking loop");
             break;
         }
 
