@@ -355,7 +355,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sweeet_db"
+name = "sweeetdb"
 version = "0.1.0"
 dependencies = [
  "anyhow",
