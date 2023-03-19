@@ -20,17 +20,6 @@ use tokio::task;
 use tokio::time::{timeout, Duration};
 use tokio_util::codec::{BytesCodec, FramedRead};
 
-#[derive(Serialize, Deserialize, Debug)]
-struct KeyValueStore {
-    store: HashMap<String, String>,
-}
-
-#[derive(Debug)]
-enum WriteOperation {
-    Set(String, String),
-    Del(String),
-}
-
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub max_connections: usize,
@@ -58,26 +47,77 @@ enum Command<'a> {
     Ping,
 }
 
-fn parse_command(command_str: &str) -> Result<Command, String> {
-    let mut parts = command_str.splitn(3, ' ');
-    let command_type = parts.next().ok_or("Missing command type")?;
+#[derive(Debug)]
+enum WriteOperation {
+    Set(String, String),
+    Del(String),
+}
 
-    match command_type.to_uppercase().as_str() {
-        "SET" => {
-            let key = parts.next().ok_or("Missing key for SET command")?;
-            let value = parts.next().ok_or("Missing value for SET command")?;
-            Ok(Command::Set(key, value))
-        }
-        "GET" => {
-            let key = parts.next().ok_or("Missing key for GET command")?;
-            Ok(Command::Get(key))
-        }
-        "DEL" => {
-            let key = parts.next().ok_or("Missing key for DEL command")?;
-            Ok(Command::Del(key))
-        }
-        "PING" => Ok(Command::Ping),
-        _ => Err(format!("Invalid command type: {}", command_type)),
+#[derive(Serialize, Deserialize, Debug)]
+struct KeyValueStore {
+    store: HashMap<String, String>,
+}
+
+#[tokio::main]
+async fn main() {
+    // Create server configuration
+    let config = ServerConfig::default();
+
+    // Run the server and handle any errors that may occur.
+    // If the server shuts down gracefully, print a message to inform the user.
+    // If there is an error during server execution, print the error message.
+    match run_server(&config).await {
+        Ok(()) => println!("Server shut down gracefully."),
+        Err(e) => eprintln!("Server error: {}", e),
+    }
+}
+
+async fn run_server(config: &ServerConfig) -> Result<()> {
+    // Create a channel for write operations
+    let (write_tx, write_rx) = mpsc::channel::<WriteOperation>(100);
+
+    // Spawn the background task for synchronization
+    task::spawn(file_storage_sync(write_rx, config.clone()));
+
+    // Bind the TcpListener to a local IP address and port.
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", config.port)).await?;
+
+    // Create an asynchronous Mutex-protected KeyValueStore, initialized with data loaded from file.
+    let storage = Arc::new(AsyncMutex::new(KeyValueStore {
+        store: load_data(&config.storage_file_path).await?,
+    }));
+
+    // Create a semaphore to limit the number of concurrent client connections.
+    let connection_semaphore = Arc::new(Semaphore::new(config.max_connections));
+
+    // Enter an infinite loop to listen for incoming client connections.
+    loop {
+        // Accept an incoming connection and get the TcpStream and the client's address.
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("Could not get the client")?;
+
+        // Clone the Arc storage and connection_semaphore to share them safely among multiple tasks.
+        let storage = storage.clone();
+        let connection_semaphore = connection_semaphore.clone();
+        let write_tx = write_tx.clone();
+        let ping_timer = config.timeout.clone();
+
+        // Spawn a new asynchronous task to handle the client connection..
+        task::spawn(async move {
+            // Acquire a permit from the semaphore. If all permits are in use, this will
+            // asynchronously wait until a permit becomes available.
+            let permit = connection_semaphore.acquire().await;
+
+            // Removed the timeout wrapper, calling handle_client directly
+            if let Err(e) = handle_client(stream, storage, write_tx, ping_timer).await {
+                println!("Error handling client: {:?}", e);
+            }
+
+            // Drop the permit, allowing another connection to be processed.
+            drop(permit);
+        });
     }
 }
 
@@ -111,7 +151,7 @@ async fn handle_client(
     let mut buffer = [0; 1024];
 
     loop {
-        // If stop_client is called close the connection
+        // Close connection if Arc variable stop clint is called
         if stop_client.load(Ordering::SeqCst) {
             break;
         }
@@ -120,7 +160,6 @@ async fn handle_client(
         let n = match timeout(Duration::from_secs(5), stream.read(&mut buffer)).await {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
-                eprintln!("Error reading from socket: {}", e);
                 return Err(anyhow!(e));
             }
             Err(_) => {
@@ -162,86 +201,38 @@ async fn handle_client(
                     .await
                     .context("Error writing response")?;
             }
-            Err(err_msg) => {
+            Err(_) => {
                 let response = b"INVALID REQUEST\n";
                 stream
                     .write_all(response)
                     .await
                     .context("Error writing response")?;
-                eprintln!("Invalid command: {}", err_msg);
             }
         }
     }
     Ok(())
 }
 
-// Handle the 'del' operation by removing the specified key from the storage.
-// Responds with 'OK' if the key is removed or 'NOT FOUND' if the key is not in the storage.
-// If the operation is successful, it also writes the updated storage to the file.
-async fn handle_del(
-    key: &str,
-    storage: &Arc<AsyncMutex<KeyValueStore>>,
-    stream: &mut TcpStream,
-    write_tx: &mpsc::Sender<WriteOperation>,
-) -> Result<()> {
-    // Lock the storage for exclusive access
-    let mut storage = storage.lock().await;
+fn parse_command(command_str: &str) -> Result<Command, String> {
+    let mut parts = command_str.splitn(3, ' ');
+    let command_type = parts.next().ok_or("Missing command type")?;
 
-    // Attempt to remove the key from the storage
-    if storage.store.remove(key).is_some() {
-        // Respond with 'OK' if the key is removed
-        let response = b"OK\n";
-        stream
-            .write_all(response)
-            .await
-            .context("Error writing response")?;
-
-        // Write the updated storage to the background task
-        if let Err(e) = write_tx.send(WriteOperation::Del(key.to_owned())).await {
-            println!("Failed to send write operation to background task: {}", e);
+    match command_type.to_uppercase().as_str() {
+        "SET" => {
+            let key = parts.next().ok_or("Missing key for SET command")?;
+            let value = parts.next().ok_or("Missing value for SET command")?;
+            Ok(Command::Set(key, value))
         }
-        Ok(())
-    } else {
-        // Respond with 'NOT FOUND' if the key is not in the storage
-        let response = b"NOT FOUND\n";
-        stream
-            .write_all(response)
-            .await
-            .context("Error writing response")?;
-
-        Ok(())
-    }
-}
-
-// Handle the 'get' operation by retrieving the value for the specified key from the storage.
-// Responds with 'OK <value>' if the key is found or 'NOT FOUND' if the key is not in the storage.
-async fn handle_get(
-    key: &str,
-    storage: &Arc<AsyncMutex<KeyValueStore>>,
-    stream: &mut TcpStream,
-) -> Result<()> {
-    // Lock the storage for shared access
-    let storage = storage.lock().await;
-
-    // Attempt to get the value for the key from the storage
-    if let Some(value) = storage.store.get(key) {
-        // Respond with 'OK <value>' if the key is found
-        let response = format!("{}\n", value);
-        stream
-            .write_all(response.as_bytes())
-            .await
-            .context("Error writing response")?;
-
-        Ok(())
-    } else {
-        // Respond with 'NOT FOUND' if the key is not in the storage
-        let response = b"NOT FOUND\n";
-        stream
-            .write_all(response)
-            .await
-            .context("Error writing response")?;
-
-        Ok(())
+        "GET" => {
+            let key = parts.next().ok_or("Missing key for GET command")?;
+            Ok(Command::Get(key))
+        }
+        "DEL" => {
+            let key = parts.next().ok_or("Missing key for DEL command")?;
+            Ok(Command::Del(key))
+        }
+        "PING" => Ok(Command::Ping),
+        _ => Err(format!("Invalid command type: {}", command_type)),
     }
 }
 
@@ -276,6 +267,75 @@ async fn handle_set(
         println!("Failed to send write operation to background task: {}", e);
     }
     Ok(())
+}
+
+// Handle the 'get' operation by retrieving the value for the specified key from the storage.
+// Responds with 'OK <value>' if the key is found or 'NOT FOUND' if the key is not in the storage.
+async fn handle_get(
+    key: &str,
+    storage: &Arc<AsyncMutex<KeyValueStore>>,
+    stream: &mut TcpStream,
+) -> Result<()> {
+    // Lock the storage for shared access
+    let storage = storage.lock().await;
+
+    // Attempt to get the value for the key from the storage
+    if let Some(value) = storage.store.get(key) {
+        // Respond with 'OK <value>' if the key is found
+        let response = format!("{}\n", value);
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .context("Error writing response")?;
+
+        Ok(())
+    } else {
+        // Respond with 'NOT FOUND' if the key is not in the storage
+        let response = b"NOT FOUND\n";
+        stream
+            .write_all(response)
+            .await
+            .context("Error writing response")?;
+
+        Ok(())
+    }
+}
+
+// Handle the 'del' operation by removing the specified key from the storage.
+// Responds with 'OK' if the key is removed or 'NOT FOUND' if the key is not in the storage.
+// If the operation is successful, it also writes the updated storage to the file.
+async fn handle_del(
+    key: &str,
+    storage: &Arc<AsyncMutex<KeyValueStore>>,
+    stream: &mut TcpStream,
+    write_tx: &mpsc::Sender<WriteOperation>,
+) -> Result<()> {
+    // Lock the storage for exclusive access
+    let mut storage = storage.lock().await;
+
+    // Attempt to remove the key from the storage
+    if storage.store.remove(key).is_some() {
+        // Respond with 'OK' if the key is removed
+        let response = b"OK\n";
+        stream
+            .write_all(response)
+            .await
+            .context("Error writing response")?;
+
+        // Write the updated storage to the background task
+        write_tx.send(WriteOperation::Del(key.to_owned())).await?;
+
+        Ok(())
+    } else {
+        // Respond with 'NOT FOUND' if the key is not in the storage
+        let response = b"NOT FOUND\n";
+        stream
+            .write_all(response)
+            .await
+            .context("Error writing response")?;
+
+        Ok(())
+    }
 }
 
 // Load data from the file, returning an empty HashMap if the file does not exist or is empty.
@@ -327,20 +387,6 @@ async fn write_to_file(store: &HashMap<String, String>, storage_file_path: &Path
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
-    // Create server configuration
-    let config = ServerConfig::default();
-
-    // Run the server and handle any errors that may occur.
-    // If the server shuts down gracefully, print a message to inform the user.
-    // If there is an error during server execution, print the error message.
-    match run_server(&config).await {
-        Ok(()) => println!("Server shut down gracefully."),
-        Err(e) => eprintln!("Server error: {}", e),
-    }
-}
-
 // Background task to synchronize write operations with the file storage
 async fn file_storage_sync(mut write_rx: mpsc::Receiver<WriteOperation>, config: ServerConfig) {
     // Load the initial data from the file
@@ -363,54 +409,5 @@ async fn file_storage_sync(mut write_rx: mpsc::Receiver<WriteOperation>, config:
         if let Err(e) = write_to_file(&file_storage, &config.storage_file_path).await {
             println!("Failed to write to file: {}", e);
         }
-    }
-}
-
-async fn run_server(config: &ServerConfig) -> Result<()> {
-    // Create a channel for write operations
-    let (write_tx, write_rx) = mpsc::channel::<WriteOperation>(100);
-
-    // Spawn the background task for synchronization
-    task::spawn(file_storage_sync(write_rx, config.clone()));
-
-    // Bind the TcpListener to a local IP address and port.
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", config.port)).await?;
-
-    // Create an asynchronous Mutex-protected KeyValueStore, initialized with data loaded from file.
-    let storage = Arc::new(AsyncMutex::new(KeyValueStore {
-        store: load_data(&config.storage_file_path).await?,
-    }));
-
-    // Create a semaphore to limit the number of concurrent client connections.
-    let connection_semaphore = Arc::new(Semaphore::new(config.max_connections));
-
-    // Enter an infinite loop to listen for incoming client connections.
-    loop {
-        // Accept an incoming connection and get the TcpStream and the client's address.
-        let (stream, _) = listener
-            .accept()
-            .await
-            .context("Could not get the client")?;
-
-        // Clone the Arc storage and connection_semaphore to share them safely among multiple tasks.
-        let storage = storage.clone();
-        let connection_semaphore = connection_semaphore.clone();
-        let write_tx = write_tx.clone();
-        let ping_timer = config.timeout.clone();
-
-        // Spawn a new asynchronous task to handle the client connection..
-        task::spawn(async move {
-            // Acquire a permit from the semaphore. If all permits are in use, this will
-            // asynchronously wait until a permit becomes available.
-            let permit = connection_semaphore.acquire().await;
-
-            // Removed the timeout wrapper, calling handle_client directly
-            if let Err(e) = handle_client(stream, storage, write_tx, ping_timer).await {
-                println!("Error handling client: {:?}", e);
-            }
-
-            // Drop the permit, allowing another connection to be processed.
-            drop(permit);
-        });
     }
 }
