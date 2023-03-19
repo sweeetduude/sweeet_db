@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 use tokio::task;
-use tokio::time::Duration;
+use tokio::time::{timeout, Duration};
 use tokio_util::codec::{BytesCodec, FramedRead};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -43,7 +43,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             max_connections: 100,
-            timeout: 60,
+            timeout: 120,
             port: 8080,
             storage_file_path: PathBuf::from("data.bin"),
         }
@@ -87,19 +87,20 @@ async fn handle_client(
     mut stream: TcpStream,
     storage: Arc<AsyncMutex<KeyValueStore>>,
     write_tx: mpsc::Sender<WriteOperation>,
+    ping_timer: u64,
 ) -> Result<()> {
     let time_elapsed = Arc::new(AtomicU64::new(0));
     let stop_client = Arc::new(AtomicBool::new(false));
-
     let time_elapsed_clone = time_elapsed.clone();
     let stop_client_clone = stop_client.clone();
 
+    // Require client to send a ping every x seconds. stop_client will break the socket look
     task::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
             let elapsed = time_elapsed_clone.load(Ordering::SeqCst) + 1;
-            if elapsed > 15 {
+            if elapsed > ping_timer {
                 stop_client_clone.store(true, Ordering::SeqCst);
                 break;
             }
@@ -109,18 +110,28 @@ async fn handle_client(
     });
 
     let mut buffer = [0; 1024];
+
     loop {
-        // Read from the socket
-        let n = match stream.read(&mut buffer).await {
-            Ok(n) => n,
-            Err(e) => {
+        // If stop_client is called close the connection
+        if stop_client.load(Ordering::SeqCst) {
+            println!("breaking loop");
+            break;
+        }
+
+        // Read from the socket every 500ms
+        let n = match timeout(Duration::from_secs(5), stream.read(&mut buffer)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
                 eprintln!("Error reading from socket: {}", e);
                 return Err(anyhow!(e));
+            }
+            Err(_) => {
+                continue;
             }
         };
 
         // If n is 0, the client closed the connection
-        if n == 0 || stop_client.load(Ordering::SeqCst) {
+        if n == 0 {
             break;
         }
 
@@ -130,33 +141,35 @@ async fn handle_client(
         // Match the command and call the appropriate handler function
         match parse_command(&request) {
             Ok(Command::Set(key, value)) => {
-                if let Err(e) = handle_set(&key, &value, &storage, &mut stream, &write_tx).await {
-                    eprintln!("Error handling SET: {:?}", e);
-                }
+                handle_set(&key, &value, &storage, &mut stream, &write_tx)
+                    .await
+                    .context("Error handling SET")?;
             }
             Ok(Command::Get(key)) => {
-                if let Err(e) = handle_get(&key, &storage, &mut stream).await {
-                    eprintln!("Error handling GET: {:?}", e);
-                }
+                handle_get(&key, &storage, &mut stream)
+                    .await
+                    .context("Error handling GET")?;
             }
             Ok(Command::Del(key)) => {
-                if let Err(e) = handle_del(&key, &storage, &mut stream, &write_tx).await {
-                    eprintln!("Error handling DEL: {:?}", e);
-                }
+                handle_del(&key, &storage, &mut stream, &write_tx)
+                    .await
+                    .context("Error handling DEL")?;
             }
             Ok(Command::Ping) => {
                 time_elapsed.store(0, Ordering::SeqCst);
 
                 let response = b"PONG\n";
-                if let Err(e) = stream.write_all(response).await {
-                    eprintln!("Error writing response: {}", e);
-                }
+                stream
+                    .write_all(response)
+                    .await
+                    .context("Error writing response")?;
             }
             Err(err_msg) => {
                 let response = b"INVALID REQUEST\n";
-                if let Err(e) = stream.write_all(response).await {
-                    eprintln!("Error writing response: {}", e);
-                }
+                stream
+                    .write_all(response)
+                    .await
+                    .context("Error writing response")?;
                 eprintln!("Invalid command: {}", err_msg);
             }
         }
@@ -385,6 +398,7 @@ async fn run_server(config: &ServerConfig) -> Result<()> {
         let storage = storage.clone();
         let connection_semaphore = connection_semaphore.clone();
         let write_tx = write_tx.clone();
+        let ping_timer = config.timeout.clone();
 
         // Spawn a new asynchronous task to handle the client connection..
         task::spawn(async move {
@@ -393,7 +407,7 @@ async fn run_server(config: &ServerConfig) -> Result<()> {
             let permit = connection_semaphore.acquire().await;
 
             // Removed the timeout wrapper, calling handle_client directly
-            if let Err(e) = handle_client(stream, storage, write_tx).await {
+            if let Err(e) = handle_client(stream, storage, write_tx, ping_timer).await {
                 println!("Error handling client: {:?}", e);
             }
 
