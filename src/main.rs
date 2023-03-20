@@ -40,14 +40,6 @@ impl Default for ServerConfig {
 }
 
 #[derive(Debug)]
-enum Command<'a> {
-    Set(&'a str, &'a str),
-    Get(&'a str),
-    Del(&'a str),
-    Ping,
-}
-
-#[derive(Debug)]
 enum WriteOperation {
     Set(String, String),
     Del(String),
@@ -173,38 +165,17 @@ async fn handle_client(
         }
 
         // Extract the request
-        let request = String::from_utf8_lossy(&buffer[..n]).trim().to_owned();
+        let request = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
 
-        // Match the command and call the appropriate handler function
-        match parse_command(&request) {
-            Ok(Command::Set(key, value)) => {
-                handle_set(&key, &value, &storage, &mut stream, &write_tx)
-                    .await
-                    .context("Error handling SET")?;
-            }
-            Ok(Command::Get(key)) => {
-                handle_get(&key, &storage, &mut stream)
-                    .await
-                    .context("Error handling GET")?;
-            }
-            Ok(Command::Del(key)) => {
-                handle_del(&key, &storage, &mut stream, &write_tx)
-                    .await
-                    .context("Error handling DEL")?;
-            }
-            Ok(Command::Ping) => {
-                time_elapsed.store(0, Ordering::SeqCst);
+        /**** END OF CLIENT ****/
 
-                let response = b"PONG\n";
+        // Call the appropriate handler function directly
+        match handle_request(&request, &storage, &mut stream, &write_tx, &time_elapsed).await {
+            Ok(()) => {}
+            Err(e) => {
+                let response = format!("INVALID REQUEST: {}\n", e);
                 stream
-                    .write_all(response)
-                    .await
-                    .context("Error writing response")?;
-            }
-            Err(_) => {
-                let response = b"INVALID REQUEST\n";
-                stream
-                    .write_all(response)
+                    .write_all(response.as_bytes())
                     .await
                     .context("Error writing response")?;
             }
@@ -213,26 +184,37 @@ async fn handle_client(
     Ok(())
 }
 
-fn parse_command(command_str: &str) -> Result<Command, String> {
-    let mut parts = command_str.splitn(3, ' ');
-    let command_type = parts.next().ok_or("Missing command type")?;
+/**** COMMAND MODULE ****/
+
+async fn handle_request(
+    request_str: &str,
+    storage: &Arc<AsyncMutex<KeyValueStore>>,
+    stream: &mut TcpStream,
+    write_tx: &mpsc::Sender<WriteOperation>,
+    time_elapsed: &Arc<AtomicU64>,
+) -> Result<()> {
+    let mut parts = request_str.splitn(2, ' ');
+
+    let command_type = match parts.next() {
+        Some(command) => command,
+        None => return Err(anyhow!("Invalid command type")),
+    };
 
     match command_type.to_uppercase().as_str() {
-        "SET" => {
-            let key = parts.next().ok_or("Missing key for SET command")?;
-            let value = parts.next().ok_or("Missing value for SET command")?;
-            Ok(Command::Set(key, value))
+        "GET" => handle_get(request_str, storage, stream).await,
+        "SET" => handle_set(request_str, storage, stream, write_tx).await,
+        "DEL" => handle_del(request_str, storage, stream, write_tx).await,
+
+        "PING" => {
+            time_elapsed.store(0, Ordering::SeqCst);
+            let response = b"PONG\n";
+            stream
+                .write_all(response)
+                .await
+                .context("Error writing response")?;
+            Ok(())
         }
-        "GET" => {
-            let key = parts.next().ok_or("Missing key for GET command")?;
-            Ok(Command::Get(key))
-        }
-        "DEL" => {
-            let key = parts.next().ok_or("Missing key for DEL command")?;
-            Ok(Command::Del(key))
-        }
-        "PING" => Ok(Command::Ping),
-        _ => Err(format!("Invalid command type: {}", command_type)),
+        _ => Err(anyhow!("Invalid command type")),
     }
 }
 
@@ -240,17 +222,28 @@ fn parse_command(command_str: &str) -> Result<Command, String> {
 // Responds with 'OK' if the key-value pair is added or updated.
 // If the operation is successful, it also writes the updated storage to the file.
 async fn handle_set(
-    key: &str,
-    value: &str,
+    request_str: &str,
     storage: &Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
     write_tx: &mpsc::Sender<WriteOperation>,
 ) -> Result<()> {
+    let mut parts = request_str.splitn(3, ' ');
+
+    let key = match parts.nth(1) {
+        Some(key) => key,
+        None => return Err(anyhow!("Invalid command type")),
+    };
+
+    let value = match parts.next() {
+        Some(value) => value,
+        None => return Err(anyhow!("Invalid command type")),
+    };
+
     // Lock the storage for exclusive access
     let mut storage = storage.lock().await;
 
     // Insert or update the key-value pair in the storage
-    storage.store.insert(key.to_owned(), value.to_string());
+    storage.store.insert(key.to_string(), value.to_string());
 
     // Respond with 'OK' if the key-value pair is added or updated
     let response = b"OK\n";
@@ -259,23 +252,28 @@ async fn handle_set(
         .await
         .context("Error writing response")?;
 
-    // Write the updated storage to the background task
-    if let Err(e) = write_tx
-        .send(WriteOperation::Set(key.to_owned(), value.to_string()))
+    write_tx
+        .send(WriteOperation::Set(key.to_string(), value.to_string()))
         .await
-    {
-        println!("Failed to send write operation to background task: {}", e);
-    }
+        .context("Failed to send write operation to background task")?;
+
     Ok(())
 }
 
 // Handle the 'get' operation by retrieving the value for the specified key from the storage.
 // Responds with 'OK <value>' if the key is found or 'NOT FOUND' if the key is not in the storage.
 async fn handle_get(
-    key: &str,
+    //key: &str,
+    request_str: &str,
     storage: &Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
 ) -> Result<()> {
+    let mut parts = request_str.splitn(3, ' ');
+
+    let key = match parts.nth(1) {
+        Some(key) => key,
+        None => return Err(anyhow!("Invalid command type")),
+    };
     // Lock the storage for shared access
     let storage = storage.lock().await;
 
@@ -305,11 +303,18 @@ async fn handle_get(
 // Responds with 'OK' if the key is removed or 'NOT FOUND' if the key is not in the storage.
 // If the operation is successful, it also writes the updated storage to the file.
 async fn handle_del(
-    key: &str,
+    //key: &str,
+    request_str: &str,
     storage: &Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
     write_tx: &mpsc::Sender<WriteOperation>,
 ) -> Result<()> {
+    let mut parts = request_str.splitn(3, ' ');
+
+    let key = match parts.nth(1) {
+        Some(key) => key,
+        None => return Err(anyhow!("Invalid command type")),
+    };
     // Lock the storage for exclusive access
     let mut storage = storage.lock().await;
 
@@ -323,7 +328,7 @@ async fn handle_del(
             .context("Error writing response")?;
 
         // Write the updated storage to the background task
-        write_tx.send(WriteOperation::Del(key.to_owned())).await?;
+        write_tx.send(WriteOperation::Del(key.to_string())).await?;
 
         Ok(())
     } else {
@@ -337,6 +342,8 @@ async fn handle_del(
         Ok(())
     }
 }
+
+/**** STORAGE MODULE ****/
 
 // Load data from the file, returning an empty HashMap if the file does not exist or is empty.
 // Returns an error if there is a problem reading the file or deserializing the contents.
