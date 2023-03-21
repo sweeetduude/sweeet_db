@@ -6,16 +6,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::fs::File;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::io::BufWriter;
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::Semaphore;
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Semaphore};
 use tokio::task;
 use tokio::time::{timeout, Duration};
 use tokio_util::codec::{BytesCodec, FramedRead};
@@ -121,9 +115,10 @@ async fn handle_client(
     write_tx: mpsc::Sender<WriteOperation>,
     ping_timer: u64,
 ) -> Result<()> {
+    // Assigning atomic reference-counting pointers to share between
     let time_elapsed = Arc::new(AtomicU64::new(0));
-    let stop_client = Arc::new(AtomicBool::new(false));
     let time_elapsed_clone = time_elapsed.clone();
+    let stop_client = Arc::new(AtomicBool::new(false));
     let stop_client_clone = stop_client.clone();
 
     // Require client to send a ping every x seconds. stop_client will break the socket look
@@ -358,6 +353,7 @@ async fn load_data(storage_file_path: &PathBuf) -> Result<HashMap<String, String
 // Returns an error if there is a problem deserializing the contents of the file.
 async fn read_from_file(file: File) -> Result<HashMap<String, String>> {
     let mut framed_read = FramedRead::new(file, BytesCodec::new());
+
     if let Some(Ok(buf)) = framed_read.next().await {
         match bincode::deserialize::<HashMap<String, String>>(&buf) {
             Ok(decoded) => Ok(decoded),
@@ -382,10 +378,12 @@ async fn write_to_file(store: &HashMap<String, String>, storage_file_path: &Path
     let mut buffered_writer = BufWriter::new(file);
 
     let serialized_data = bincode::serialize(&store).context("Error serializing data")?;
+
     buffered_writer
         .write_all(&serialized_data)
         .await
         .context("Error writing to file")?;
+
     buffered_writer
         .flush()
         .await
