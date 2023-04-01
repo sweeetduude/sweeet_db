@@ -124,6 +124,7 @@ async fn handle_client(
     // Require client to send a ping every x seconds. stop_client will break the socket look
     task::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
+
         loop {
             interval.tick().await;
             let elapsed = time_elapsed_clone.load(Ordering::SeqCst) + 1;
@@ -135,6 +136,7 @@ async fn handle_client(
         }
     });
 
+    // Create a buffer to store the request
     let mut buffer = [0; 1024];
 
     loop {
@@ -162,11 +164,12 @@ async fn handle_client(
         // Extract the request
         let request = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
 
-        /**** END OF CLIENT ****/
-
         // Call the appropriate handler function directly
-        match handle_request(&request, &storage, &mut stream, &write_tx, &time_elapsed).await {
-            Ok(()) => {}
+        match handle_request(&request, &storage, &mut stream, &write_tx).await {
+            Ok(()) => {
+                // Prolong the client's connection
+                time_elapsed.store(0, Ordering::SeqCst);
+            }
             Err(e) => {
                 let response = format!("INVALID REQUEST: {}\n", e);
                 stream
@@ -186,22 +189,21 @@ async fn handle_request(
     storage: &Arc<AsyncMutex<KeyValueStore>>,
     stream: &mut TcpStream,
     write_tx: &mpsc::Sender<WriteOperation>,
-    time_elapsed: &Arc<AtomicU64>,
 ) -> Result<()> {
     let mut parts = request_str.splitn(2, ' ');
 
+    // Get the command type from the request.
     let command_type = match parts.next() {
         Some(command) => command,
         None => return Err(anyhow!("Invalid command type")),
     };
 
+    // Call the appropriate handler function based on the command type.
     match command_type.to_uppercase().as_str() {
         "GET" => handle_get(request_str, storage, stream).await,
         "SET" => handle_set(request_str, storage, stream, write_tx).await,
         "DEL" => handle_del(request_str, storage, stream, write_tx).await,
-
         "PING" => {
-            time_elapsed.store(0, Ordering::SeqCst);
             let response = b"PONG\n";
             stream
                 .write_all(response)
@@ -247,6 +249,7 @@ async fn handle_set(
         .await
         .context("Error writing response")?;
 
+    // Send the updated storage to the background task to write to the file
     write_tx
         .send(WriteOperation::Set(key.to_string(), value.to_string()))
         .await
@@ -310,6 +313,7 @@ async fn handle_del(
         Some(key) => key,
         None => return Err(anyhow!("Invalid command type")),
     };
+
     // Lock the storage for exclusive access
     let mut storage = storage.lock().await;
 
@@ -375,15 +379,19 @@ async fn write_to_file(store: &HashMap<String, String>, storage_file_path: &Path
         .await
         .context("Error opening file")?;
 
+    // Use a buffered writer to improve performance
     let mut buffered_writer = BufWriter::new(file);
 
+    // Serialize the data into a byte array
     let serialized_data = bincode::serialize(&store).context("Error serializing data")?;
 
+    // Write the serialized data to the file
     buffered_writer
         .write_all(&serialized_data)
         .await
         .context("Error writing to file")?;
 
+    // Flush the buffered writer to ensure the data is written to the file
     buffered_writer
         .flush()
         .await
