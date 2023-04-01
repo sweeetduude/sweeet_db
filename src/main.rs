@@ -88,7 +88,7 @@ async fn run_server(config: &ServerConfig) -> Result<()> {
         let storage = storage.clone();
         let connection_semaphore = connection_semaphore.clone();
         let write_tx = write_tx.clone();
-        let ping_timer = config.timeout.clone();
+        let timeout_timer = config.timeout.clone();
 
         // Spawn a new asynchronous task to handle the client connection..
         task::spawn(async move {
@@ -97,7 +97,7 @@ async fn run_server(config: &ServerConfig) -> Result<()> {
             let permit = connection_semaphore.acquire().await;
 
             // Removed the timeout wrapper, calling handle_client directly
-            if let Err(e) = handle_client(stream, storage, write_tx, ping_timer).await {
+            if let Err(e) = handle_client(stream, storage, write_tx, timeout_timer).await {
                 println!("Error handling client: {:?}", e);
             }
 
@@ -113,7 +113,7 @@ async fn handle_client(
     mut stream: TcpStream,
     storage: Arc<AsyncMutex<KeyValueStore>>,
     write_tx: mpsc::Sender<WriteOperation>,
-    ping_timer: u64,
+    timeout_timer: u64,
 ) -> Result<()> {
     // Assigning atomic reference-counting pointers to share between
     let time_elapsed = Arc::new(AtomicU64::new(0));
@@ -121,14 +121,17 @@ async fn handle_client(
     let stop_client = Arc::new(AtomicBool::new(false));
     let stop_client_clone = stop_client.clone();
 
-    // Require client to send a ping every x seconds. stop_client will break the socket look
+    // Create a background task to check for inactivity
     task::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
 
         loop {
+            // Wait for the next tick
             interval.tick().await;
             let elapsed = time_elapsed_clone.load(Ordering::SeqCst) + 1;
-            if elapsed > ping_timer {
+
+            // Close connection if timeout is reached
+            if elapsed > timeout_timer {
                 stop_client_clone.store(true, Ordering::SeqCst);
                 break;
             }
@@ -167,10 +170,11 @@ async fn handle_client(
         // Call the appropriate handler function directly
         match handle_request(&request, &storage, &mut stream, &write_tx).await {
             Ok(()) => {
-                // Prolong the client's connection
+                // Prolong the client's connection if the request was successful
                 time_elapsed.store(0, Ordering::SeqCst);
             }
             Err(e) => {
+                // If request was invalid, send an error message to the client
                 let response = format!("INVALID REQUEST: {}\n", e);
                 stream
                     .write_all(response.as_bytes())
@@ -226,11 +230,13 @@ async fn handle_set(
 ) -> Result<()> {
     let mut parts = request_str.splitn(3, ' ');
 
+    // Extract the key from the request
     let key = match parts.nth(1) {
         Some(key) => key,
         None => return Err(anyhow!("Invalid command type")),
     };
 
+    // Extract the value from the request
     let value = match parts.next() {
         Some(value) => value,
         None => return Err(anyhow!("Invalid command type")),
