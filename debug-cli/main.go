@@ -33,6 +33,7 @@ func main() {
 
 		if strings.ToLower(command) == "connect" {
 			conn, _ = net.Dial("tcp", serverAddress)
+			command = "PING"
 		}
 
 		if strings.ToLower(command) == "exit" {
@@ -49,6 +50,7 @@ func main() {
 }
 
 func sendCommand(command string, conn net.Conn) (string, error) {
+	startTime := time.Now() // capture start time
 
 	err := conn.SetWriteDeadline(time.Now().Add(timeout))
 	if err != nil {
@@ -70,6 +72,9 @@ func sendCommand(command string, conn net.Conn) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}
+
+	elapsedTime := time.Since(startTime)
+	fmt.Printf("Time: %v\n", elapsedTime)
 
 	return strings.TrimSpace(response), nil
 }
